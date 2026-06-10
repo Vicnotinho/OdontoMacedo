@@ -253,17 +253,19 @@ def inicializar_banco():
 
 def carregar_lista_cache():
     """Busca a lista (uuid, nome, precisa_retorno) uma vez e guarda na sessão."""
-    if st.session_state.get("cache_lista") is None:
-        st.session_state.cache_lista = _exec(
+    cache = st.session_state.get("lista_cache_v2")
+    if cache is None:
+        cache = _exec(
             [("SELECT uuid, nome, COALESCE(precisa_retorno, 0) "
               "FROM pacientes ORDER BY LOWER(nome)", None)],
             fetch="all",
         )
-    return st.session_state.cache_lista
+        st.session_state.lista_cache_v2 = cache
+    return cache
 
 
 def invalidar_cache_lista():
-    st.session_state.cache_lista = None
+    st.session_state.lista_cache_v2 = None
 
 
 def listar_pacientes(filtro=""):
