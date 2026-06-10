@@ -14,6 +14,8 @@
 # Para rodar:  streamlit run app.py
 # ============================================================================
 
+import io
+import os
 import uuid
 import unicodedata
 from datetime import datetime, date
@@ -27,7 +29,7 @@ st.set_page_config(page_title="Odonto Macedo", page_icon="🦷", layout="wide")
 # ----------------------------------------------------------------------------
 # CONFIGURAÇÕES GERAIS
 # ----------------------------------------------------------------------------
-USUARIOS = ["Dr. Valter", "Dr. Victor", "Dra. Natalia", "Dr. Yuri"]
+USUARIOS = ["Dr. Valter", "Dr. Victor", "Dra. Natalia"]
 
 SEPARADOR = "|||"  # mesmo separador do programa antigo
 LINHA_VISUAL = "\n\n" + "_" * 50 + "\n\n"
@@ -337,6 +339,122 @@ def excluir_paciente(uid):
 
 
 # ----------------------------------------------------------------------------
+# GERAÇÃO DE PDF  (prontuário completo / histórico clínico / orçamento)
+# ----------------------------------------------------------------------------
+def _assinatura_profissional(usuario):
+    u = (usuario or "").lower()
+    if "valter" in u:
+        return "Dr. Valter Macedo - CRO/RS 9357"
+    if "victor" in u:
+        return "Dr. Victor Rodrigues Macedo - CRO/RS 30750"
+    if "natalia" in u:
+        return "Dra. Natalia Macedo - CRO/RS 33912"
+    return "Cirurgião-Dentista"
+
+
+def gerar_pdf(tipo, dados, usuario):
+    """Gera um PDF em memória. tipo: 'completo' | 'historico' | 'orcamento'.
+    dados: dict com os campos do paciente."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.utils import ImageReader
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+        Image as ImageRL, PageBreak,
+    )
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=2 * cm,
+                            leftMargin=2 * cm, topMargin=1 * cm, bottomMargin=2 * cm)
+    elementos = []
+    estilos = getSampleStyleSheet()
+    verde = colors.HexColor("#00897B")
+    estilo_titulo = ParagraphStyle("T", parent=estilos["Heading1"], fontSize=20,
+                                   textColor=verde, spaceAfter=2)
+    estilo_sub = ParagraphStyle("S", parent=estilos["Heading2"], fontSize=12,
+                                spaceBefore=14, textColor=colors.darkblue)
+    estilo_normal = ParagraphStyle("N", parent=estilos["Normal"], fontSize=10, leading=14)
+
+    # Cabeçalho com logo (se existir logo.png na pasta)
+    titulo_txt = {"completo": "Prontuário Clínico",
+                  "historico": "Histórico Clínico",
+                  "orcamento": "Orçamento"}.get(tipo, "Documento")
+    cabecalho_dir = [Paragraph("<b>ODONTO MACEDO</b>", estilo_titulo),
+                     Paragraph(titulo_txt, estilo_normal)]
+    if os.path.exists("logo.png"):
+        try:
+            ir = ImageReader("logo.png")
+            lw, lh = ir.getSize()
+            larg = 4.5 * cm
+            alt = larg * (lh / float(lw))
+            img = ImageRL("logo.png", width=larg, height=alt)
+            t = Table([[img, cabecalho_dir]], colWidths=[5 * cm, 11 * cm])
+            t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
+            elementos.append(t)
+        except Exception:
+            elementos.extend(cabecalho_dir)
+    else:
+        elementos.extend(cabecalho_dir)
+    elementos.append(Spacer(1, 14))
+
+    # Dados do paciente
+    def p(label, valor):
+        return Paragraph(f"<b>{label}:</b> {valor or ''}", estilo_normal)
+
+    linhas_dados = [
+        [p("Paciente", dados.get("nome")), p("CPF", dados.get("cpf"))],
+        [p("Nascimento", dados.get("nascimento")), p("Telefone", dados.get("telefone"))],
+        [p("Endereço", dados.get("endereco")), p("Profissão", dados.get("profissao"))],
+    ]
+    td = Table(linhas_dados, colWidths=[10 * cm, 7 * cm])
+    td.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    elementos.append(td)
+
+    def bloco(titulo, texto):
+        elementos.append(Paragraph(titulo, estilo_sub))
+        txt = (texto or "").strip() or "—"
+        elementos.append(Paragraph(txt.replace("\n", "<br/>"), estilo_normal))
+
+    if tipo in ("completo", "historico"):
+        if tipo == "completo":
+            bloco("MOTIVO DA CONSULTA", dados.get("motivo"))
+            bloco("HISTÓRICO DE SAÚDE", dados.get("historico_saude"))
+        bloco("EVOLUÇÃO CLÍNICA", dados.get("evolucao"))
+
+    if tipo in ("completo", "orcamento"):
+        bloco("ORÇAMENTO / PLANO DE TRATAMENTO", dados.get("orcamento"))
+
+    # Assinatura
+    elementos.append(Spacer(1, 40))
+    t_ass = Table([
+        ["_______________________________", "_______________________________"],
+        ["Assinatura do Paciente", _assinatura_profissional(usuario)],
+    ], colWidths=[8 * cm, 8 * cm])
+    t_ass.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                               ("FONTSIZE", (0, 0), (-1, -1), 9)]))
+    elementos.append(t_ass)
+
+    if tipo == "orcamento":
+        elementos.append(Spacer(1, 20))
+        elementos.append(Paragraph(
+            "Este orçamento tem validade de 15 dias. Valores sujeitos a alteração "
+            "conforme evolução clínica.",
+            ParagraphStyle("sm", parent=estilos["Normal"], fontSize=8,
+                           textColor=colors.grey, alignment=1)))
+
+    doc.build(elementos)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ----------------------------------------------------------------------------
 # FUNÇÕES AUXILIARES
 # ----------------------------------------------------------------------------
 def remover_acentos(texto):
@@ -452,11 +570,17 @@ def cb_gravar_evolucao():
 # ----------------------------------------------------------------------------
 # INÍCIO
 # ----------------------------------------------------------------------------
+def mostrar_logo(width=220):
+    if os.path.exists("logo.png"):
+        st.image("logo.png", width=width)
+
+
 # --- TELA DE SENHA (login simples) ---
 if "autenticado" not in st.session_state:
     st.session_state.autenticado = False
 
 if not st.session_state.autenticado:
+    mostrar_logo()
     st.title("🦷 Odonto Macedo")
     st.markdown("#### Acesso ao sistema")
     senha = st.text_input("Senha", type="password")
@@ -476,6 +600,7 @@ if "usuario" not in st.session_state:
 
 # --- ESCOLHA DO DENTISTA ---
 if not st.session_state.usuario:
+    mostrar_logo()
     st.title("🦷 Odonto Macedo")
     st.markdown("### Quem está usando?")
     escolha = st.selectbox("Usuário", USUARIOS)
@@ -503,6 +628,7 @@ if st.session_state.get("_acao_pendente"):
 
 # --- BARRA LATERAL: usuário, busca e lista de pacientes ---
 with st.sidebar:
+    mostrar_logo(width=160)
     st.markdown(f"**👤 {st.session_state.usuario}**")
     if st.button("Sair", use_container_width=True):
         st.session_state.usuario = None
@@ -548,8 +674,9 @@ else:
     st.title("➕ Novo paciente")
 
 # --- ABAS ---
-aba_cad, aba_pront, aba_orc, aba_ret = st.tabs(
-    ["📋 Cadastro & Anamnese", "🦷 Prontuário / Evolução", "💰 Orçamento", "🔁 Retorno"]
+aba_cad, aba_pront, aba_orc, aba_ret, aba_pdf = st.tabs(
+    ["📋 Cadastro & Anamnese", "🦷 Prontuário / Evolução", "💰 Orçamento",
+     "🔁 Retorno", "📄 Gerar PDF"]
 )
 
 # ===== ABA 1: CADASTRO & ANAMNESE =====
@@ -635,6 +762,50 @@ with aba_ret:
         min_value=date(1900, 1, 1), max_value=date(2100, 1, 1), format="DD/MM/YYYY",
     )
     st.text_area("Anotações do retorno", key="f_texto_retorno", height=160)
+
+# ===== ABA 5: GERAR PDF =====
+with aba_pdf:
+    uid_pdf = st.session_state.get("paciente_id")
+    if not uid_pdf:
+        st.info("Salve o paciente primeiro para gerar o PDF.")
+    else:
+        tipo_label = st.radio(
+            "Qual documento?",
+            ["Prontuário completo", "Só histórico clínico", "Só orçamento"],
+        )
+        mapa = {"Prontuário completo": "completo",
+                "Só histórico clínico": "historico",
+                "Só orçamento": "orcamento"}
+        tipo = mapa[tipo_label]
+
+        if st.button("📄 Gerar PDF", type="primary"):
+            dados_pdf = {
+                "nome": st.session_state.get("f_nome", ""),
+                "cpf": st.session_state.get("f_cpf", ""),
+                "nascimento": st.session_state.get("f_data_nascimento").strftime("%d/%m/%Y")
+                if st.session_state.get("f_data_nascimento") else "",
+                "telefone": st.session_state.get("f_telefone", ""),
+                "endereco": st.session_state.get("f_endereco", ""),
+                "profissao": st.session_state.get("f_profissao", ""),
+                "motivo": st.session_state.get("f_motivo", ""),
+                "historico_saude": st.session_state.get("f_historico", ""),
+                "evolucao": st.session_state.get("f_historico_view", ""),
+                "orcamento": st.session_state.get("f_orcamento", ""),
+            }
+            try:
+                pdf_bytes = gerar_pdf(tipo, dados_pdf, st.session_state.get("usuario"))
+                nome_limpo = "".join(ch for ch in dados_pdf["nome"]
+                                     if ch.isalnum() or ch == " ").strip().replace(" ", "_")
+                st.session_state.pdf_pronto = (
+                    f"{tipo}_{nome_limpo or 'paciente'}.pdf", pdf_bytes
+                )
+            except Exception as e:
+                st.error(f"Erro ao gerar PDF: {e}")
+
+        if st.session_state.get("pdf_pronto"):
+            nome_arq, conteudo = st.session_state.pdf_pronto
+            st.download_button("⬇️ Baixar PDF", data=conteudo, file_name=nome_arq,
+                               mime="application/pdf")
 
 # --- AÇÕES PRINCIPAIS (rodapé) ---
 st.divider()
