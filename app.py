@@ -252,10 +252,11 @@ def inicializar_banco():
 
 
 def carregar_lista_cache():
-    """Busca a lista (uuid, nome) uma vez e guarda na sessão (mais rápido)."""
+    """Busca a lista (uuid, nome, precisa_retorno) uma vez e guarda na sessão."""
     if st.session_state.get("cache_lista") is None:
         st.session_state.cache_lista = _exec(
-            [("SELECT uuid, nome FROM pacientes ORDER BY LOWER(nome)", None)],
+            [("SELECT uuid, nome, COALESCE(precisa_retorno, 0) "
+              "FROM pacientes ORDER BY LOWER(nome)", None)],
             fetch="all",
         )
     return st.session_state.cache_lista
@@ -266,18 +267,18 @@ def invalidar_cache_lista():
 
 
 def listar_pacientes(filtro=""):
-    """Retorna lista de (uuid, nome), com busca inteligente (ignora acentos)."""
+    """Retorna lista de (uuid, nome, precisa_retorno), com busca que ignora acentos."""
     todos = carregar_lista_cache()
     if not filtro:
         return todos
     palavras = remover_acentos(filtro).split()
     resultado = []
-    for uid, nome in todos:
+    for uid, nome, ret in todos:
         if not nome:
             continue
         nome_limpo = remover_acentos(nome)
         if all(p in nome_limpo for p in palavras):
-            resultado.append((uid, nome))
+            resultado.append((uid, nome, ret))
     return resultado
 
 
@@ -488,6 +489,15 @@ def status_cpf(cpf_raw):
     return ("ok", "CPF válido")
 
 
+def calcular_idade(d):
+    """Retorna a idade em anos a partir de uma data de nascimento (date)."""
+    if not d:
+        return None
+    hoje = date.today()
+    idade = hoje.year - d.year - ((hoje.month, hoje.day) < (d.month, d.day))
+    return idade if 0 <= idade <= 130 else None
+
+
 def parse_data(s, padrao=None):
     try:
         return datetime.strptime(s, "%Y-%m-%d").date()
@@ -645,14 +655,18 @@ with st.sidebar:
     total = len(pacientes)
     LIMITE = 40  # quantos botões mostrar por vez (evita travar com muitos pacientes)
 
+    qtd_retorno = sum(1 for _, _, ret in pacientes if ret)
     st.caption(f"{total} paciente(s) encontrado(s)")
+    if qtd_retorno:
+        st.caption(f"🔔 {qtd_retorno} aguardando retorno")
     if total > LIMITE:
         st.caption(f"Mostrando os primeiros {LIMITE}. Digite na busca acima para achar os demais.")
 
     paciente_atual = st.session_state.get("paciente_id")
-    for uid, nome in pacientes[:LIMITE]:
+    for uid, nome, ret in pacientes[:LIMITE]:
+        rotulo = f"🔔 {nome}" if ret else nome
         st.button(
-            nome,
+            rotulo,
             key=f"pac_{uid}",
             use_container_width=True,
             type="primary" if uid == paciente_atual else "secondary",
@@ -700,6 +714,9 @@ with aba_cad:
             "Data de nascimento", key="f_data_nascimento",
             min_value=date(1900, 1, 1), max_value=date.today(), format="DD/MM/YYYY",
         )
+        _idade = calcular_idade(st.session_state.get("f_data_nascimento"))
+        if _idade is not None:
+            st.caption(f"🎂 Idade: {_idade} anos")
     with col2:
         st.text_input("Endereço", key="f_endereco")
         st.text_input("Profissão", key="f_profissao")
@@ -850,11 +867,21 @@ with col_b:
     if st.session_state.get("paciente_id"):
         if st.button("🗑️ Excluir paciente", use_container_width=True):
             st.session_state.confirmar_exclusao = True
+            st.session_state.txt_conf_excluir = ""  # limpa confirmação anterior
 
 if st.session_state.get("confirmar_exclusao"):
-    st.warning("Tem certeza que deseja excluir este paciente? Esta ação não pode ser desfeita.")
+    nome_excluir = (st.session_state.get("f_nome") or "este paciente").strip()
+    st.warning(
+        f"⚠️ Você está prestes a excluir **{nome_excluir}**. "
+        "Esta ação **não pode ser desfeita** e apaga todo o histórico deste paciente."
+    )
+    st.text_input(
+        'Para confirmar, digite **EXCLUIR** (em maiúsculas):',
+        key="txt_conf_excluir", placeholder="EXCLUIR",
+    )
+    pode_excluir = st.session_state.get("txt_conf_excluir", "").strip() == "EXCLUIR"
     c1, c2, _ = st.columns([1, 1, 4])
-    if c1.button("Sim, excluir"):
+    if c1.button("Sim, excluir", disabled=not pode_excluir):
         excluir_paciente(st.session_state.get("paciente_id"))
         st.session_state.confirmar_exclusao = False
         st.session_state._acao_pendente = ("novo",)
