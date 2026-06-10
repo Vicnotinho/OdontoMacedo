@@ -341,6 +341,15 @@ def excluir_paciente(uid):
     invalidar_cache_lista()
 
 
+def listar_retornos():
+    """Pacientes que precisam de retorno, com data e anotação, ordenados por data."""
+    return _exec([(
+        "SELECT uuid, nome, data_retorno, texto_retorno FROM pacientes "
+        "WHERE COALESCE(precisa_retorno, 0) = 1 "
+        "ORDER BY data_retorno NULLS LAST, LOWER(nome)", None,
+    )], fetch="all")
+
+
 # ----------------------------------------------------------------------------
 # GERAÇÃO DE PDF  (prontuário completo / histórico clínico / orçamento)
 # ----------------------------------------------------------------------------
@@ -638,6 +647,30 @@ if st.session_state.get("_acao_pendente"):
     if fa:
         st.session_state.flash = fa
 
+@st.dialog("🔔 Pacientes aguardando retorno")
+def dialog_retornos():
+    linhas = listar_retornos()
+    if not linhas:
+        st.write("Nenhum paciente aguardando retorno.")
+        return
+    st.caption(f"{len(linhas)} paciente(s):")
+    for uid, nome, dret, txt in linhas:
+        try:
+            data_fmt = datetime.strptime(dret, "%Y-%m-%d").strftime("%d/%m/%Y")
+        except Exception:
+            data_fmt = ""
+        rotulo = f"**{nome}**"
+        if data_fmt:
+            rotulo += f" — 📅 {data_fmt}"
+        st.markdown(rotulo)
+        if txt and txt.strip():
+            st.caption(txt.strip())
+        if st.button("Abrir ficha", key=f"ret_open_{uid}"):
+            st.session_state._acao_pendente = ("recarregar", uid)
+            st.rerun()
+        st.divider()
+
+
 # --- BARRA LATERAL: usuário, busca e lista de pacientes ---
 with st.sidebar:
     mostrar_logo()
@@ -657,10 +690,11 @@ with st.sidebar:
     total = len(pacientes)
     LIMITE = 40  # quantos botões mostrar por vez (evita travar com muitos pacientes)
 
-    qtd_retorno = sum(1 for _, _, ret in pacientes if ret)
+    qtd_retorno = sum(1 for _, _, ret in carregar_lista_cache() if ret)
     st.caption(f"{total} paciente(s) encontrado(s)")
     if qtd_retorno:
-        st.caption(f"🔔 {qtd_retorno} aguardando retorno")
+        if st.button(f"🔔 {qtd_retorno} aguardando retorno", use_container_width=True):
+            dialog_retornos()
     if total > LIMITE:
         st.caption(f"Mostrando os primeiros {LIMITE}. Digite na busca acima para achar os demais.")
 
