@@ -16,7 +16,6 @@
 
 import uuid
 import unicodedata
-from contextlib import contextmanager
 from datetime import datetime, date
 
 import streamlit as st
@@ -179,73 +178,84 @@ def _get_pool():
     )
 
 
-@contextmanager
-def db_cursor(commit=False):
-    """Pega uma conexão do pool, garante que está viva e devolve um cursor."""
-    pool = _get_pool()
-    conn = pool.getconn()
-    descartar = False
-    try:
-        # confere se a conexão ainda está viva (Supabase fecha conexões ociosas)
+def _exec(statements, fetch=None, commit=False):
+    """Executa um ou mais comandos numa ÚNICA ida ao banco.
+    statements: lista de (sql, params). fetch: 'one' ou 'all' (do último comando).
+    Se a conexão tiver morrido (Supabase fecha as ociosas), tenta de novo 1 vez."""
+    erro = None
+    for tentativa in range(2):
+        pool = _get_pool()
+        conn = pool.getconn()
         try:
-            with conn.cursor() as ping:
-                ping.execute("SELECT 1")
+            cur = conn.cursor()
+            for sql, params in statements:
+                cur.execute(sql, params or ())
+            data = None
+            if fetch == "one":
+                data = cur.fetchone()
+            elif fetch == "all":
+                data = cur.fetchall()
+            if commit:
+                conn.commit()
+            cur.close()
+            pool.putconn(conn)
+            return data
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            # conexão morta: descarta, recria o pool e tenta mais uma vez
+            erro = e
+            try:
+                pool.putconn(conn, close=True)
+            except Exception:
+                pass
+            _get_pool.clear()
+            continue
         except Exception:
-            pool.putconn(conn, close=True)
-            conn = pool.getconn()
-        cur = conn.cursor()
-        yield cur
-        if commit:
-            conn.commit()
-        cur.close()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            descartar = True
-        raise
-    finally:
-        pool.putconn(conn, close=descartar)
+            try:
+                conn.rollback()
+                pool.putconn(conn)
+            except Exception:
+                try:
+                    pool.putconn(conn, close=True)
+                except Exception:
+                    pass
+            raise
+    raise erro
 
 
-def criar_tabelas():
-    """Cria as tabelas se ainda não existirem (PostgreSQL)."""
-    with db_cursor(commit=True) as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS pacientes (
+@st.cache_resource
+def inicializar_banco():
+    """Cria as tabelas se não existirem. Roda UMA vez por sessão do servidor."""
+    _exec([
+        ("""CREATE TABLE IF NOT EXISTS pacientes (
                 uuid TEXT PRIMARY KEY,
                 nome TEXT, cpf TEXT, telefone TEXT, email TEXT,
                 data_nascimento TEXT, endereco TEXT, profissao TEXT,
                 como_conheceu TEXT, observacoes TEXT, motivo TEXT,
                 historico TEXT, evolucao TEXT, orcamento TEXT,
                 precisa_retorno INTEGER DEFAULT 0, data_retorno TEXT, texto_retorno TEXT
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS livro_caixa (
+            )""", None),
+        ("""CREATE TABLE IF NOT EXISTS livro_caixa (
                 id SERIAL PRIMARY KEY, dentista TEXT, data TEXT, descricao TEXT,
                 tipo TEXT, forma TEXT, valor REAL
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS devedores (
+            )""", None),
+        ("""CREATE TABLE IF NOT EXISTS devedores (
                 paciente_uuid TEXT PRIMARY KEY, falta TEXT
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS estoque (
+            )""", None),
+        ("""CREATE TABLE IF NOT EXISTS estoque (
                 id SERIAL PRIMARY KEY, nome TEXT, categoria TEXT,
                 quantidade INTEGER, validade TEXT
-            )
-        """)
+            )""", None),
+    ], commit=True)
+    return True
 
 
 def carregar_lista_cache():
     """Busca a lista (uuid, nome) uma vez e guarda na sessão (mais rápido)."""
     if st.session_state.get("cache_lista") is None:
-        with db_cursor() as c:
-            c.execute("SELECT uuid, nome FROM pacientes ORDER BY LOWER(nome)")
-            st.session_state.cache_lista = c.fetchall()
+        st.session_state.cache_lista = _exec(
+            [("SELECT uuid, nome FROM pacientes ORDER BY LOWER(nome)", None)],
+            fetch="all",
+        )
     return st.session_state.cache_lista
 
 
@@ -270,9 +280,10 @@ def listar_pacientes(filtro=""):
 
 
 def carregar_paciente(uid):
-    with db_cursor() as c:
-        c.execute(f"SELECT {','.join(CAMPOS)} FROM pacientes WHERE uuid=%s", (uid,))
-        row = c.fetchone()
+    row = _exec(
+        [(f"SELECT {','.join(CAMPOS)} FROM pacientes WHERE uuid=%s", (uid,))],
+        fetch="one",
+    )
     if not row:
         return None
     return dict(zip(CAMPOS, row))
@@ -281,19 +292,19 @@ def carregar_paciente(uid):
 def salvar_paciente(uid, dados):
     """Insere (uid None) ou atualiza. Não mexe na evolução. Retorna (uid, erro)."""
     try:
-        with db_cursor(commit=True) as c:
-            if uid:
-                sets = ", ".join(f"{k}=%s" for k in CAMPOS_SALVAR)
-                valores = [dados[k] for k in CAMPOS_SALVAR] + [uid]
-                c.execute(f"UPDATE pacientes SET {sets} WHERE uuid=%s", valores)
-            else:
-                uid = str(uuid.uuid4())
-                cols = ["uuid"] + CAMPOS_SALVAR
-                ph = ", ".join(["%s"] * len(cols))
-                valores = [uid] + [dados[k] for k in CAMPOS_SALVAR]
-                c.execute(
-                    f"INSERT INTO pacientes ({', '.join(cols)}) VALUES ({ph})", valores
-                )
+        if uid:
+            sets = ", ".join(f"{k}=%s" for k in CAMPOS_SALVAR)
+            valores = [dados[k] for k in CAMPOS_SALVAR] + [uid]
+            _exec([(f"UPDATE pacientes SET {sets} WHERE uuid=%s", valores)], commit=True)
+        else:
+            uid = str(uuid.uuid4())
+            cols = ["uuid"] + CAMPOS_SALVAR
+            ph = ", ".join(["%s"] * len(cols))
+            valores = [uid] + [dados[k] for k in CAMPOS_SALVAR]
+            _exec(
+                [(f"INSERT INTO pacientes ({', '.join(cols)}) VALUES ({ph})", valores)],
+                commit=True,
+            )
         invalidar_cache_lista()
         return uid, None
     except Exception as e:
@@ -301,26 +312,27 @@ def salvar_paciente(uid, dados):
 
 
 def gravar_evolucao(uid, texto_novo):
-    """Acrescenta uma nova evolução ao histórico usando o separador |||."""
-    with db_cursor(commit=True) as c:
-        c.execute("SELECT evolucao FROM pacientes WHERE uuid=%s", (uid,))
-        r = c.fetchone()
-        antigo = r[0] if r and r[0] else ""
-        novo = (antigo + SEPARADOR + texto_novo) if antigo else texto_novo
-        c.execute("UPDATE pacientes SET evolucao=%s WHERE uuid=%s", (novo, uid))
+    """Acrescenta uma nova evolução ao histórico (separador |||), numa só ida ao banco."""
+    _exec([(
+        "UPDATE pacientes SET evolucao = "
+        "CASE WHEN evolucao IS NULL OR evolucao = '' THEN %s "
+        "ELSE evolucao || %s END WHERE uuid = %s",
+        (texto_novo, SEPARADOR + texto_novo, uid),
+    )], commit=True)
 
 
 def salvar_historico_editado(uid, texto_visual):
     """Salva o histórico inteiro depois de editado na tela."""
     texto_banco = texto_visual.replace(LINHA_VISUAL, SEPARADOR)
-    with db_cursor(commit=True) as c:
-        c.execute("UPDATE pacientes SET evolucao=%s WHERE uuid=%s", (texto_banco, uid))
+    _exec([("UPDATE pacientes SET evolucao=%s WHERE uuid=%s", (texto_banco, uid))],
+          commit=True)
 
 
 def excluir_paciente(uid):
-    with db_cursor(commit=True) as c:
-        c.execute("DELETE FROM devedores WHERE paciente_uuid=%s", (uid,))
-        c.execute("DELETE FROM pacientes WHERE uuid=%s", (uid,))
+    _exec([
+        ("DELETE FROM devedores WHERE paciente_uuid=%s", (uid,)),
+        ("DELETE FROM pacientes WHERE uuid=%s", (uid,)),
+    ], commit=True)
     invalidar_cache_lista()
 
 
@@ -456,8 +468,8 @@ if not st.session_state.autenticado:
             st.error("Senha incorreta.")
     st.stop()
 
-# Só cria as tabelas DEPOIS de autenticar (evita conectar no banco à toa)
-criar_tabelas()
+# Cria as tabelas uma única vez (não a cada tela) — isso já acelera bastante
+inicializar_banco()
 
 if "usuario" not in st.session_state:
     st.session_state.usuario = None
