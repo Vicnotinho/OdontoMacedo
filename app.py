@@ -570,9 +570,9 @@ def cb_gravar_evolucao():
 # ----------------------------------------------------------------------------
 # INÍCIO
 # ----------------------------------------------------------------------------
-def mostrar_logo(width=220):
+def mostrar_logo():
     if os.path.exists("logo.png"):
-        st.image("logo.png", width=width)
+        st.image("logo.png", use_container_width=True)
 
 
 # --- TELA DE SENHA (login simples) ---
@@ -628,7 +628,7 @@ if st.session_state.get("_acao_pendente"):
 
 # --- BARRA LATERAL: usuário, busca e lista de pacientes ---
 with st.sidebar:
-    mostrar_logo(width=160)
+    mostrar_logo()
     st.markdown(f"**👤 {st.session_state.usuario}**")
     if st.button("Sair", use_container_width=True):
         st.session_state.usuario = None
