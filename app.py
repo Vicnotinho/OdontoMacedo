@@ -1,0 +1,682 @@
+# -*- coding: utf-8 -*-
+# ============================================================================
+# ODONTO MACEDO — Versão Web (Streamlit) — PARTE 1: PRONTUÁRIO
+# ----------------------------------------------------------------------------
+# Esta é a primeira parte do sistema migrado para web.
+# Cobre: login, lista/busca de pacientes, cadastro, anamnese, evolução clínica
+# (com o sistema de histórico "|||" do programa original), modelos de
+# procedimento, orçamento e retorno.
+#
+# Usa o MESMO banco de dados do programa antigo (pacientes.db). Se você colocar
+# o seu "pacientes.db" atual na mesma pasta deste arquivo, todos os seus
+# pacientes já aparecem aqui.
+#
+# Para rodar:  streamlit run app.py
+# ============================================================================
+
+import uuid
+import unicodedata
+from contextlib import contextmanager
+from datetime import datetime, date
+
+import streamlit as st
+import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
+
+st.set_page_config(page_title="Odonto Macedo", page_icon="🦷", layout="wide")
+
+# ----------------------------------------------------------------------------
+# CONFIGURAÇÕES GERAIS
+# ----------------------------------------------------------------------------
+USUARIOS = ["Dr. Valter", "Dr. Victor", "Dra. Natalia", "Dr. Yuri"]
+
+SEPARADOR = "|||"  # mesmo separador do programa antigo
+LINHA_VISUAL = "\n\n" + "_" * 50 + "\n\n"
+
+# Todos os campos do paciente (mesma estrutura do banco antigo)
+CAMPOS = [
+    "nome", "cpf", "telefone", "email", "data_nascimento",
+    "endereco", "profissao", "como_conheceu", "observacoes",
+    "motivo", "historico", "evolucao", "orcamento",
+    "precisa_retorno", "data_retorno", "texto_retorno",
+]
+# A evolução é gravada separadamente (botão Gravar), então o "Salvar" geral
+# não mexe nela:
+CAMPOS_SALVAR = [c for c in CAMPOS if c != "evolucao"]
+
+# ----------------------------------------------------------------------------
+# MODELOS PADRÃO (iguais ao programa original)
+# ----------------------------------------------------------------------------
+MODELO_MOTIVO = (
+    "O que levou à consulta:\n"
+    "Sintomas atuais e há quanto tempo:\n"
+    "Grau da dor:\n"
+    "Necessidade estética:"
+)
+MODELO_HISTORICO = (
+    "Doenças sistêmicas:\n"
+    "Medicamentos em uso:\n"
+    "Histórico Odontológico Anterior:\n"
+    "Traumas Faciais:\n"
+    "Cirurgias:"
+)
+MODELO_FINANCEIRO = (
+    "Tipo de atendimento: Particular\n"
+    "Valor:\n"
+    "Forma de pagamento:\n"
+    "Pendente:\n"
+    "Observação:"
+)
+MODELO_RETORNO = (
+    "Motivo do retorno:\n"
+    "Status do tratamento:"
+)
+
+TEMPLATES_ENDO = {
+    "Abertura Coronária": (
+        "• Anestesia local com anestésico ??? pela técnica ???\n"
+        "• Isolamento absoluto com grampo ???\n"
+        "• Abertura coronária realizada com broca ??? na face ???\n"
+        "• Localização dos canais radiculares\n"
+        "• Irrigação com NaCl 2%\n"
+    ),
+    "Reabertura Coronária": (
+        "• Anestesia local com anestésico ??? pela técnica ???\n"
+        "• Isolamento absoluto com grampo ???\n"
+        "• Remoção da restauração provisória com broca ??? na face ???\n"
+        "• Localização dos canais radiculares\n"
+        "• Irrigação com NaCl 2,5%\n"
+        "• Remoção do medicamento intracanal\n"
+    ),
+    "Odontometria": (
+        "• Odontometria realizada por método eletrônico e radiográfico\n"
+        "• Comprimento de trabalho estabelecido sendo ???\n"
+    ),
+    "PQM": (
+        "• Preparo químico-mecânico com lima mecanizada ??? no(s) canal(is)\n"
+        "• Irrigação com NaCl 2,5%\n"
+    ),
+    "Medicamento Intracanal": (
+        "• Aplicação de medicamento intracanal Ultracall\n"
+        "• Selamento com mecha de algodão\n"
+    ),
+    "Troca de Medicamento Intracanal": (
+        "• Isolamento absoluto\n"
+        "• Remoção da restauração provisória\n"
+        "• Toalete final com ativação de ??? com NaCl 2,5% e EDTA 17%\n"
+        "• Secagem dos canais\n"
+        "• Nova aplicação de medicamento intracanal Ultracall + mecha de algodão\n"
+        "• Selamento provisório com restaurador provisório + ionômero de vidro\n"
+        "• Ajuste oclusal\n"
+    ),
+    "Toalete Final": (
+        "• Toalete final com ativação de ??? com NaCl 2,5% e EDTA 17%\n"
+        "• Secagem dos canais\n"
+    ),
+    "Obturação": (
+        "• Conometria realizada\n"
+        "• Obturação dos canais radiculares com técnica de ??? e cimento AH Plus\n"
+        "• Radiografia de controle com adequada qualidade\n"
+    ),
+    "Desobturação": (
+        "• Realizada desobturação dos canais radiculares com limas manuais e solvente\n"
+        "• Repreparo com lima mecanizada ???\n"
+    ),
+    "Restauração Provisória": (
+        "• Restauração provisória realizada com Coltosol + ionômero de vidro\n"
+        "• Ajuste oclusal realizado\n"
+        "• Paciente orientado a retornar em ??? para continuação ou finalização\n"
+    ),
+}
+TEMPLATES_GERAL = {
+    "Avaliação Clínica Inicial": (
+        "• Código 221 Uniodonto\n"
+        "• Consulta Odontológica Inicial\n"
+        "• Profilaxia: Polimento Coronário\n"
+        "• Aplicação Tópica de Flúor\n"
+        "• Remoção dos Fatores de Retenção do Biofilme Dental (Placa Bacteriana)\n"
+        "• Controle de Cárie Incipiente\n"
+        "• Atividade Educativa em Saúde Bucal\n"
+    ),
+    "Restauração": (
+        "• Restauração do dente ??? na face ???\n"
+        "• Com isolamento ???\n"
+        "• Resina ???\n"
+        "• Polimento e acabamento\n"
+        "• Ajuste Oclusal\n"
+    ),
+    "Clareamento": (
+        "• Escolha do abridor bucal sendo ???\n"
+        "• Primeira - Segunda - Terceira\n"
+        "• Proteção gengival com top dam\n"
+        "• Aplicação dos líquidos de proporção 3 para 1 whiteness 35%\n"
+        "• Ativação em 3 de um minuto e meio e tempo de 5 minutos durante as ativações\n"
+        "• Remoção da proteção gengival\n"
+    ),
+}
+# Junta tudo num dicionário só, com prefixo pra saber a categoria
+TEMPLATES = {}
+for k, v in TEMPLATES_ENDO.items():
+    TEMPLATES[f"[Endo] {k}"] = v
+for k, v in TEMPLATES_GERAL.items():
+    TEMPLATES[f"[Geral] {k}"] = v
+
+
+# ----------------------------------------------------------------------------
+# BANCO DE DADOS
+# ----------------------------------------------------------------------------
+@st.cache_resource
+def _get_pool():
+    """Cria uma vez só um 'pool' de conexões com o banco na nuvem (Supabase)."""
+    return ThreadedConnectionPool(
+        1, 10,
+        host=st.secrets["db_host"],
+        port=st.secrets.get("db_port", "5432"),
+        dbname=st.secrets.get("db_name", "postgres"),
+        user=st.secrets["db_user"],
+        password=st.secrets["db_password"],
+        sslmode="require",
+    )
+
+
+@contextmanager
+def db_cursor(commit=False):
+    """Pega uma conexão do pool, garante que está viva e devolve um cursor."""
+    pool = _get_pool()
+    conn = pool.getconn()
+    descartar = False
+    try:
+        # confere se a conexão ainda está viva (Supabase fecha conexões ociosas)
+        try:
+            with conn.cursor() as ping:
+                ping.execute("SELECT 1")
+        except Exception:
+            pool.putconn(conn, close=True)
+            conn = pool.getconn()
+        cur = conn.cursor()
+        yield cur
+        if commit:
+            conn.commit()
+        cur.close()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            descartar = True
+        raise
+    finally:
+        pool.putconn(conn, close=descartar)
+
+
+def criar_tabelas():
+    """Cria as tabelas se ainda não existirem (PostgreSQL)."""
+    with db_cursor(commit=True) as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS pacientes (
+                uuid TEXT PRIMARY KEY,
+                nome TEXT, cpf TEXT, telefone TEXT, email TEXT,
+                data_nascimento TEXT, endereco TEXT, profissao TEXT,
+                como_conheceu TEXT, observacoes TEXT, motivo TEXT,
+                historico TEXT, evolucao TEXT, orcamento TEXT,
+                precisa_retorno INTEGER DEFAULT 0, data_retorno TEXT, texto_retorno TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS livro_caixa (
+                id SERIAL PRIMARY KEY, dentista TEXT, data TEXT, descricao TEXT,
+                tipo TEXT, forma TEXT, valor REAL
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS devedores (
+                paciente_uuid TEXT PRIMARY KEY, falta TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS estoque (
+                id SERIAL PRIMARY KEY, nome TEXT, categoria TEXT,
+                quantidade INTEGER, validade TEXT
+            )
+        """)
+
+
+def carregar_lista_cache():
+    """Busca a lista (uuid, nome) uma vez e guarda na sessão (mais rápido)."""
+    if st.session_state.get("cache_lista") is None:
+        with db_cursor() as c:
+            c.execute("SELECT uuid, nome FROM pacientes ORDER BY LOWER(nome)")
+            st.session_state.cache_lista = c.fetchall()
+    return st.session_state.cache_lista
+
+
+def invalidar_cache_lista():
+    st.session_state.cache_lista = None
+
+
+def listar_pacientes(filtro=""):
+    """Retorna lista de (uuid, nome), com busca inteligente (ignora acentos)."""
+    todos = carregar_lista_cache()
+    if not filtro:
+        return todos
+    palavras = remover_acentos(filtro).split()
+    resultado = []
+    for uid, nome in todos:
+        if not nome:
+            continue
+        nome_limpo = remover_acentos(nome)
+        if all(p in nome_limpo for p in palavras):
+            resultado.append((uid, nome))
+    return resultado
+
+
+def carregar_paciente(uid):
+    with db_cursor() as c:
+        c.execute(f"SELECT {','.join(CAMPOS)} FROM pacientes WHERE uuid=%s", (uid,))
+        row = c.fetchone()
+    if not row:
+        return None
+    return dict(zip(CAMPOS, row))
+
+
+def salvar_paciente(uid, dados):
+    """Insere (uid None) ou atualiza. Não mexe na evolução. Retorna (uid, erro)."""
+    try:
+        with db_cursor(commit=True) as c:
+            if uid:
+                sets = ", ".join(f"{k}=%s" for k in CAMPOS_SALVAR)
+                valores = [dados[k] for k in CAMPOS_SALVAR] + [uid]
+                c.execute(f"UPDATE pacientes SET {sets} WHERE uuid=%s", valores)
+            else:
+                uid = str(uuid.uuid4())
+                cols = ["uuid"] + CAMPOS_SALVAR
+                ph = ", ".join(["%s"] * len(cols))
+                valores = [uid] + [dados[k] for k in CAMPOS_SALVAR]
+                c.execute(
+                    f"INSERT INTO pacientes ({', '.join(cols)}) VALUES ({ph})", valores
+                )
+        invalidar_cache_lista()
+        return uid, None
+    except Exception as e:
+        return uid, str(e)
+
+
+def gravar_evolucao(uid, texto_novo):
+    """Acrescenta uma nova evolução ao histórico usando o separador |||."""
+    with db_cursor(commit=True) as c:
+        c.execute("SELECT evolucao FROM pacientes WHERE uuid=%s", (uid,))
+        r = c.fetchone()
+        antigo = r[0] if r and r[0] else ""
+        novo = (antigo + SEPARADOR + texto_novo) if antigo else texto_novo
+        c.execute("UPDATE pacientes SET evolucao=%s WHERE uuid=%s", (novo, uid))
+
+
+def salvar_historico_editado(uid, texto_visual):
+    """Salva o histórico inteiro depois de editado na tela."""
+    texto_banco = texto_visual.replace(LINHA_VISUAL, SEPARADOR)
+    with db_cursor(commit=True) as c:
+        c.execute("UPDATE pacientes SET evolucao=%s WHERE uuid=%s", (texto_banco, uid))
+
+
+def excluir_paciente(uid):
+    with db_cursor(commit=True) as c:
+        c.execute("DELETE FROM devedores WHERE paciente_uuid=%s", (uid,))
+        c.execute("DELETE FROM pacientes WHERE uuid=%s", (uid,))
+    invalidar_cache_lista()
+
+
+# ----------------------------------------------------------------------------
+# FUNÇÕES AUXILIARES
+# ----------------------------------------------------------------------------
+def remover_acentos(texto):
+    if not texto:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", texto)
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower()
+
+
+def cpf_valido(cpf):
+    cpf = "".join(filter(str.isdigit, cpf or ""))
+    if len(cpf) != 11 or cpf == cpf[0] * 11:
+        return False
+    soma = sum(int(cpf[i]) * (10 - i) for i in range(9))
+    d1 = (soma * 10) % 11
+    d1 = 0 if d1 == 10 else d1
+    soma = sum(int(cpf[i]) * (11 - i) for i in range(10))
+    d2 = (soma * 10) % 11
+    d2 = 0 if d2 == 10 else d2
+    return cpf[-2:] == f"{d1}{d2}"
+
+
+def status_cpf(cpf_raw):
+    cpf = "".join(filter(str.isdigit, cpf_raw or ""))
+    if not cpf:
+        return None
+    if len(cpf) < 11:
+        return ("warning", "CPF incompleto")
+    if not cpf_valido(cpf):
+        return ("error", "CPF inválido")
+    return ("ok", "CPF válido")
+
+
+def parse_data(s, padrao=None):
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return padrao or date.today()
+
+
+# ----------------------------------------------------------------------------
+# CALLBACKS (rodam ANTES da tela ser redesenhada — por isso podem mexer
+# nos campos do formulário com segurança)
+# ----------------------------------------------------------------------------
+def preencher_form(dados, uid):
+    st.session_state.paciente_id = uid
+    st.session_state.f_nome = dados.get("nome") or ""
+    st.session_state.f_cpf = dados.get("cpf") or ""
+    st.session_state.f_telefone = dados.get("telefone") or ""
+    st.session_state.f_email = dados.get("email") or ""
+    st.session_state.f_data_nascimento = parse_data(dados.get("data_nascimento"))
+    st.session_state.f_endereco = dados.get("endereco") or ""
+    st.session_state.f_profissao = dados.get("profissao") or ""
+    st.session_state.f_como_conheceu = dados.get("como_conheceu") or ""
+    st.session_state.f_observacoes = dados.get("observacoes") or ""
+    st.session_state.f_motivo = dados.get("motivo") or ""
+    st.session_state.f_historico = dados.get("historico") or ""
+    st.session_state.f_orcamento = dados.get("orcamento") or ""
+    st.session_state.f_precisa_retorno = bool(dados.get("precisa_retorno"))
+    st.session_state.f_data_retorno = parse_data(dados.get("data_retorno"))
+    st.session_state.f_texto_retorno = dados.get("texto_retorno") or ""
+    ev = dados.get("evolucao") or ""
+    st.session_state.f_historico_view = ev.replace(SEPARADOR, LINHA_VISUAL)
+    st.session_state.f_nova_evolucao = ""
+
+
+def cb_selecionar_paciente(uid):
+    dados = carregar_paciente(uid) or {}
+    preencher_form(dados, uid)
+
+
+def cb_novo_paciente():
+    branco = {
+        "motivo": MODELO_MOTIVO,
+        "historico": MODELO_HISTORICO,
+        "orcamento": MODELO_FINANCEIRO,
+        "texto_retorno": MODELO_RETORNO,
+    }
+    preencher_form(branco, None)
+    st.session_state.flash = ("info", "Novo paciente iniciado. Preencha e clique em Salvar.")
+
+
+def cb_inserir_template():
+    nome_tpl = st.session_state.get("sel_template")
+    if nome_tpl and nome_tpl in TEMPLATES:
+        atual = st.session_state.get("f_nova_evolucao", "")
+        st.session_state.f_nova_evolucao = atual + TEMPLATES[nome_tpl]
+
+
+def cb_adicionar_data():
+    agora = datetime.now().strftime("%d/%m/%Y %H:%M")
+    usuario = st.session_state.get("usuario", "Usuário")
+    bloco = f"\n------------------\n{agora} – {usuario}\n"
+    atual = st.session_state.get("f_nova_evolucao", "")
+    st.session_state.f_nova_evolucao = atual + bloco
+
+
+def cb_gravar_evolucao():
+    uid = st.session_state.get("paciente_id")
+    texto = (st.session_state.get("f_nova_evolucao") or "").strip()
+    if not uid:
+        st.session_state.flash = ("warning", "Salve o paciente antes de gravar a evolução.")
+        return
+    if not texto:
+        st.session_state.flash = ("warning", "Escreva a evolução antes de gravar.")
+        return
+    gravar_evolucao(uid, texto)
+    dados = carregar_paciente(uid) or {}
+    preencher_form(dados, uid)
+    st.session_state.flash = ("success", "Evolução gravada no histórico!")
+
+
+# ----------------------------------------------------------------------------
+# INÍCIO
+# ----------------------------------------------------------------------------
+# --- TELA DE SENHA (login simples) ---
+if "autenticado" not in st.session_state:
+    st.session_state.autenticado = False
+
+if not st.session_state.autenticado:
+    st.title("🦷 Odonto Macedo")
+    st.markdown("#### Acesso ao sistema")
+    senha = st.text_input("Senha", type="password")
+    if st.button("Entrar", type="primary"):
+        if senha and senha == st.secrets.get("app_password", ""):
+            st.session_state.autenticado = True
+            st.rerun()
+        else:
+            st.error("Senha incorreta.")
+    st.stop()
+
+# Só cria as tabelas DEPOIS de autenticar (evita conectar no banco à toa)
+criar_tabelas()
+
+if "usuario" not in st.session_state:
+    st.session_state.usuario = None
+
+# --- ESCOLHA DO DENTISTA ---
+if not st.session_state.usuario:
+    st.title("🦷 Odonto Macedo")
+    st.markdown("### Quem está usando?")
+    escolha = st.selectbox("Usuário", USUARIOS)
+    if st.button("Continuar", type="primary"):
+        st.session_state.usuario = escolha
+        cb_novo_paciente()  # começa com a ficha em branco
+        st.rerun()
+    st.stop()
+
+# Garante que sempre exista uma ficha carregada
+if "paciente_id" not in st.session_state:
+    cb_novo_paciente()
+
+# Processa ações pendentes (recarregar/novo paciente) ANTES de desenhar os campos.
+# Isso evita o erro de "mexer num widget depois que ele já apareceu na tela".
+if st.session_state.get("_acao_pendente"):
+    acao = st.session_state.pop("_acao_pendente")
+    if acao[0] == "recarregar":
+        cb_selecionar_paciente(acao[1])
+    elif acao[0] == "novo":
+        cb_novo_paciente()
+    fa = st.session_state.pop("_flash_apos", None)
+    if fa:
+        st.session_state.flash = fa
+
+# --- BARRA LATERAL: usuário, busca e lista de pacientes ---
+with st.sidebar:
+    st.markdown(f"**👤 {st.session_state.usuario}**")
+    if st.button("Sair", use_container_width=True):
+        st.session_state.usuario = None
+        st.rerun()
+
+    st.button("➕ Novo paciente", use_container_width=True, on_click=cb_novo_paciente)
+    if st.button("🔄 Atualizar lista", use_container_width=True):
+        invalidar_cache_lista()
+        st.rerun()
+    st.text_input("🔍 Buscar paciente", key="busca", placeholder="Nome ou parte do nome")
+    st.divider()
+
+    pacientes = listar_pacientes(st.session_state.get("busca", ""))
+    total = len(pacientes)
+    LIMITE = 40  # quantos botões mostrar por vez (evita travar com muitos pacientes)
+
+    st.caption(f"{total} paciente(s) encontrado(s)")
+    if total > LIMITE:
+        st.caption(f"Mostrando os primeiros {LIMITE}. Digite na busca acima para achar os demais.")
+
+    paciente_atual = st.session_state.get("paciente_id")
+    for uid, nome in pacientes[:LIMITE]:
+        st.button(
+            nome,
+            key=f"pac_{uid}",
+            use_container_width=True,
+            type="primary" if uid == paciente_atual else "secondary",
+            on_click=cb_selecionar_paciente,
+            args=(uid,),
+        )
+
+# --- MENSAGENS (flash) ---
+flash = st.session_state.pop("flash", None)
+if flash:
+    tipo, msg = flash
+    getattr(st, tipo if tipo in ("success", "warning", "error", "info") else "info")(msg)
+
+# --- CABEÇALHO ---
+nome_atual = st.session_state.get("f_nome", "").strip()
+if st.session_state.get("paciente_id"):
+    st.title(nome_atual or "Paciente sem nome")
+else:
+    st.title("➕ Novo paciente")
+
+# --- ABAS ---
+aba_cad, aba_pront, aba_orc, aba_ret = st.tabs(
+    ["📋 Cadastro & Anamnese", "🦷 Prontuário / Evolução", "💰 Orçamento", "🔁 Retorno"]
+)
+
+# ===== ABA 1: CADASTRO & ANAMNESE =====
+with aba_cad:
+    col1, col2 = st.columns(2)
+    with col1:
+        st.text_input("Nome *", key="f_nome")
+        st.text_input("CPF", key="f_cpf")
+        s = status_cpf(st.session_state.get("f_cpf", ""))
+        if s:
+            tipo, txt = s
+            if tipo == "ok":
+                st.caption(f"✅ {txt}")
+            elif tipo == "warning":
+                st.caption(f"🟠 {txt}")
+            else:
+                st.caption(f"🔴 {txt}")
+        st.text_input("Telefone", key="f_telefone")
+        st.text_input("E-mail", key="f_email")
+        st.date_input(
+            "Data de nascimento", key="f_data_nascimento",
+            min_value=date(1900, 1, 1), max_value=date.today(), format="DD/MM/YYYY",
+        )
+    with col2:
+        st.text_input("Endereço", key="f_endereco")
+        st.text_input("Profissão", key="f_profissao")
+        st.text_input("Como conheceu", key="f_como_conheceu")
+        st.text_area("Observações", key="f_observacoes", height=120)
+
+    st.divider()
+    st.markdown("#### Anamnese")
+    col3, col4 = st.columns(2)
+    with col3:
+        st.text_area("Motivo da consulta", key="f_motivo", height=160)
+    with col4:
+        st.text_area("Histórico de saúde", key="f_historico", height=160)
+
+# ===== ABA 2: PRONTUÁRIO / EVOLUÇÃO =====
+with aba_pront:
+    st.markdown("#### Histórico de evolução")
+    st.text_area(
+        "Histórico (pode editar e salvar)", key="f_historico_view", height=260,
+        help="Registros antigos separados por linhas. Edite se precisar corrigir.",
+    )
+    col_h1, col_h2 = st.columns([1, 3])
+    with col_h1:
+        if st.button("💾 Salvar edição do histórico"):
+            uid = st.session_state.get("paciente_id")
+            if not uid:
+                st.warning("Salve o paciente primeiro.")
+            else:
+                salvar_historico_editado(uid, st.session_state.get("f_historico_view", ""))
+                st.session_state._acao_pendente = ("recarregar", uid)
+                st.session_state._flash_apos = ("success", "Histórico atualizado!")
+                st.rerun()
+
+    st.divider()
+    st.markdown("#### Nova evolução")
+    col_t1, col_t2, col_t3 = st.columns([3, 1, 1])
+    with col_t1:
+        st.selectbox("Modelo de procedimento", options=list(TEMPLATES.keys()), key="sel_template")
+    with col_t2:
+        st.write("")
+        st.write("")
+        st.button("➕ Inserir modelo", on_click=cb_inserir_template, use_container_width=True)
+    with col_t3:
+        st.write("")
+        st.write("")
+        st.button("🕐 Data/hora", on_click=cb_adicionar_data, use_container_width=True)
+
+    st.text_area("Escreva a evolução de hoje", key="f_nova_evolucao", height=200)
+    st.button("✅ Gravar evolução", type="primary", on_click=cb_gravar_evolucao)
+
+# ===== ABA 3: ORÇAMENTO =====
+with aba_orc:
+    st.text_area("Orçamento / Plano de tratamento", key="f_orcamento", height=300)
+
+# ===== ABA 4: RETORNO =====
+with aba_ret:
+    st.checkbox("Este paciente precisa de retorno", key="f_precisa_retorno")
+    st.date_input(
+        "Data do retorno", key="f_data_retorno",
+        min_value=date(1900, 1, 1), max_value=date(2100, 1, 1), format="DD/MM/YYYY",
+    )
+    st.text_area("Anotações do retorno", key="f_texto_retorno", height=160)
+
+# --- AÇÕES PRINCIPAIS (rodapé) ---
+st.divider()
+col_a, col_b, _ = st.columns([1, 1, 3])
+with col_a:
+    if st.button("💾 Salvar paciente", type="primary", use_container_width=True):
+        nome = st.session_state.get("f_nome", "").strip()
+        if not nome:
+            st.warning("O nome do paciente é obrigatório.")
+        else:
+            cpf_raw = st.session_state.get("f_cpf", "")
+            cpf_limpo = "".join(filter(str.isdigit, cpf_raw))
+            dados = {
+                "nome": nome,
+                "cpf": cpf_raw if cpf_limpo else None,
+                "telefone": st.session_state.get("f_telefone", ""),
+                "email": st.session_state.get("f_email", ""),
+                "data_nascimento": st.session_state.get("f_data_nascimento").strftime("%Y-%m-%d"),
+                "endereco": st.session_state.get("f_endereco", ""),
+                "profissao": st.session_state.get("f_profissao", ""),
+                "como_conheceu": st.session_state.get("f_como_conheceu", ""),
+                "observacoes": st.session_state.get("f_observacoes", ""),
+                "motivo": st.session_state.get("f_motivo", ""),
+                "historico": st.session_state.get("f_historico", ""),
+                "orcamento": st.session_state.get("f_orcamento", ""),
+                "precisa_retorno": 1 if st.session_state.get("f_precisa_retorno") else 0,
+                "data_retorno": st.session_state.get("f_data_retorno").strftime("%Y-%m-%d"),
+                "texto_retorno": st.session_state.get("f_texto_retorno", ""),
+            }
+            novo_uid, erro = salvar_paciente(st.session_state.get("paciente_id"), dados)
+            if erro:
+                if "UNIQUE" in erro and "cpf" in erro:
+                    st.error("Já existe um paciente com este CPF.")
+                else:
+                    st.error(f"Erro ao salvar: {erro}")
+            else:
+                st.session_state._acao_pendente = ("recarregar", novo_uid)
+                st.session_state._flash_apos = ("success", "Cadastro salvo com sucesso!")
+                st.rerun()
+
+with col_b:
+    if st.session_state.get("paciente_id"):
+        if st.button("🗑️ Excluir paciente", use_container_width=True):
+            st.session_state.confirmar_exclusao = True
+
+if st.session_state.get("confirmar_exclusao"):
+    st.warning("Tem certeza que deseja excluir este paciente? Esta ação não pode ser desfeita.")
+    c1, c2, _ = st.columns([1, 1, 4])
+    if c1.button("Sim, excluir"):
+        excluir_paciente(st.session_state.get("paciente_id"))
+        st.session_state.confirmar_exclusao = False
+        st.session_state._acao_pendente = ("novo",)
+        st.session_state._flash_apos = ("success", "Paciente excluído.")
+        st.rerun()
+    if c2.button("Cancelar"):
+        st.session_state.confirmar_exclusao = False
+        st.rerun()
