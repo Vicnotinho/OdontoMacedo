@@ -19,12 +19,20 @@ import os
 import uuid
 import unicodedata
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
 
 st.set_page_config(page_title="Odonto Macedo", page_icon="🦷", layout="wide")
+
+# Fuso horário de Brasília (o servidor roda em UTC, então fixamos o nosso)
+TZ = ZoneInfo("America/Sao_Paulo")
+
+
+def agora_br():
+    return datetime.now(TZ)
 
 # ----------------------------------------------------------------------------
 # CONFIGURAÇÕES GERAIS
@@ -566,7 +574,7 @@ def cb_inserir_template():
 
 
 def cb_adicionar_data():
-    agora = datetime.now().strftime("%d/%m/%Y %H:%M")
+    agora = agora_br().strftime("%d/%m/%Y %H:%M")
     usuario = st.session_state.get("usuario", "Usuário")
     bloco = f"\n------------------\n{agora} – {usuario}\n"
     atual = st.session_state.get("f_nova_evolucao", "")
@@ -591,9 +599,20 @@ def cb_gravar_evolucao():
 # ----------------------------------------------------------------------------
 # INÍCIO
 # ----------------------------------------------------------------------------
-def mostrar_logo():
+def mostrar_logo(largura=None):
     if os.path.exists("logo.png"):
-        st.image("logo.png", use_container_width=True)
+        if largura:
+            st.image("logo.png", width=largura)
+        else:
+            st.image("logo.png", use_container_width=True)
+
+
+def mostrar_logo_login():
+    """Logo das telas de login: tamanho moderado e centralizado."""
+    if os.path.exists("logo.png"):
+        c = st.columns([1, 2, 1])
+        with c[1]:
+            st.image("logo.png", use_container_width=True)
 
 
 # --- TELA DE SENHA (login simples) ---
@@ -601,7 +620,7 @@ if "autenticado" not in st.session_state:
     st.session_state.autenticado = False
 
 if not st.session_state.autenticado:
-    mostrar_logo()
+    mostrar_logo_login()
     st.title("🦷 Odonto Macedo")
     st.markdown("#### Acesso ao sistema")
     senha = st.text_input("Senha", type="password")
@@ -621,7 +640,7 @@ if "usuario" not in st.session_state:
 
 # --- ESCOLHA DO DENTISTA ---
 if not st.session_state.usuario:
-    mostrar_logo()
+    mostrar_logo_login()
     st.title("🦷 Odonto Macedo")
     st.markdown("### Quem está usando?")
     escolha = st.selectbox("Usuário", USUARIOS)
